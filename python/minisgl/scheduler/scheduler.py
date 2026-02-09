@@ -57,7 +57,7 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-        self.cache_manager = CacheManager(self.device, self.engine.num_pages, config.cache_type)
+        self.cache_manager = CacheManager(self.device, self.engine.num_pages, config.cache_type, config.page_size)
         self.decode_manager = DecodeManager()
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
@@ -143,7 +143,9 @@ class Scheduler(SchedulerIOMixin):
         batch.out_loc = self.cache_manager.allocate(needed_size)
         # NOTE: Pad the batch if needed
         if padding_size := self.engine.graph_runner.pad_batch(batch):
-            batch.out_loc = F.pad(batch.out_loc, (0, padding_size), value=self.engine.dummy_page)
+            # Convert dummy_page (page index) to flat index for padding
+            dummy_flat_idx = self.engine.dummy_page * self.cache_manager.page_size
+            batch.out_loc = F.pad(batch.out_loc, (0, padding_size), value=dummy_flat_idx)
         # NOTE: prepare 2d indices for token ids loading and writing
         load_indices = self._make_2d_indices(
             [(r.table_idx, r.cached_len, r.device_len) for r in batch.padded_reqs]
@@ -160,7 +162,9 @@ class Scheduler(SchedulerIOMixin):
         )
         assert all(r.device_len < self.engine.max_seq_len for r in batch.reqs)
         # NOTE: write out_loc to page_table before `prepare_metadata`
-        self.page_table.view(-1)[load_indices] = batch.out_loc
+        # Convert flat indices back to page indices for page_table
+        page_indices = batch.out_loc // self.cache_manager.page_size
+        self.page_table.view(-1)[load_indices] = page_indices
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
