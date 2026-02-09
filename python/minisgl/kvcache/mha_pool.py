@@ -88,6 +88,13 @@ class MHAKVCache(BaseKVCache):
         """
         from minisgl.kernel import store_cache
 
+        # Convert k, v to match cache dtype if needed (e.g., bfloat16 -> fp8)
+        cache_dtype = self._kv_buffer.dtype
+        if k.dtype != cache_dtype:
+            k = k.to(cache_dtype)
+        if v.dtype != cache_dtype:
+            v = v.to(cache_dtype)
+
         # The store_cache kernel expects flat indices into the flattened (num_pages * page_size, ...) view
         store_cache(
             k_cache=self._k_buffer[layer_id].view(-1, self._storage_shape[2], self._storage_shape[3]),
