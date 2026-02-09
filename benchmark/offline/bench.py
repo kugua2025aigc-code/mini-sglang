@@ -359,6 +359,14 @@ def create_config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
               f"({batch} * {seq_len} / 16)")
     elif args.max_kv_pages is not None:
         overrides["max_kv_pages"] = args.max_kv_pages
+    elif args.batch is not None:
+        # Auto-adjust max_kv_pages when batch is overridden (but not explicitly set)
+        # Calculate based on the new batch size and original seq_len ratio
+        seq_len = args.seq_len or base_config.max_seq_len
+        batch = args.batch
+        overrides["max_kv_pages"] = (batch * seq_len) // 16
+        print(f"[Auto] Adjusted max_kv_pages for batch={batch}: {overrides['max_kv_pages']} "
+              f"({batch} * {seq_len} / 16)")
     
     # Apply overrides
     if overrides:
