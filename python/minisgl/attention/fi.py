@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Dict, List, Literal
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 from minisgl.distributed import get_tp_info
@@ -48,23 +48,24 @@ class FICaptureData(BaseCaptureData):
 class FIMetadata(BaseAttnMetadata):
     # fmt: off
     cu_seqlens_q_cpu:   torch.Tensor  # on cpu
-    cu_seqlens_k_cpu:   torch.Tensor  # on cpu
+    cu_seqlens_k_cpu:   torch.Tensor  # on cpu - contains page-based indptr
     cu_seqlens_q_gpu:   torch.Tensor  # on gpu
-    indices:            torch.Tensor  # on gpu
-    last_page_len_cpu:  torch.Tensor  # on cpu
+    indices:            torch.Tensor  # on gpu - page indices
+    last_page_len_cpu:  torch.Tensor  # on cpu - length of last page for each seq
     num_qo_heads:       int
     num_kv_heads:       int
     head_dim:           int
-    page_size:          Literal[1] # currently only support page_size=1
+    page_size:          int  # tokens per page (e.g., 16)
     pos_encoding_mode:  str
-    seq_lens_cpu:       torch.Tensor  # on cpu
+    seq_lens_cpu:       torch.Tensor  # on cpu - token lengths
     dtype:              torch.dtype
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
     initialized:        bool = False
+    window_left:        int = -1  # -1 means infinite context window (no sliding window)
     # fmt: on
 
     def __post_init__(self) -> None:
-        assert self.page_size == 1, "Currently only page_size=1 is supported."
+        assert self.page_size > 0, f"page_size must be positive, got {self.page_size}"
         assert (
             self.positions.is_cuda
             and self.cu_seqlens_k_cpu.is_cpu
@@ -88,6 +89,8 @@ class FlashInferBackend(BaseAttnBackend):
         config: ModelConfig,
         kvcache: BaseKVCache,
         page_table: torch.Tensor,
+        page_size: int = 16,
+        sliding_window: Optional[int] = None,
     ) -> None:
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
@@ -97,9 +100,14 @@ class FlashInferBackend(BaseAttnBackend):
         self.config = config
         self.kvcache = kvcache
         self.device = kvcache.device
+        self.page_size = page_size
+        # sliding_window: -1 means infinite context window, positive value enables sliding window
+        self.window_left = sliding_window if sliding_window and sliding_window > 0 else -1
+        
         self.float_workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
+        
         self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             kv_layout="NHD",
@@ -122,6 +130,8 @@ class FlashInferBackend(BaseAttnBackend):
         self.kv_head_local = div_even(self.config.num_kv_heads, tp_size)
 
         self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
+        self.cached_last_page_lens: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
+        
         # for cuda graph
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
@@ -151,6 +161,7 @@ class FlashInferBackend(BaseAttnBackend):
                 data_type=metadata.dtype,
                 q_data_type=metadata.dtype,
                 kv_data_type=metadata.dtype,
+                window_left=metadata.window_left,
                 non_blocking=True,
             )
         else:
@@ -167,6 +178,7 @@ class FlashInferBackend(BaseAttnBackend):
                 seq_lens=metadata.seq_lens_cpu,
                 q_data_type=metadata.dtype,
                 kv_data_type=metadata.dtype,
+                window_left=metadata.window_left,
                 non_blocking=True,
                 causal=True,
             )
@@ -178,6 +190,31 @@ class FlashInferBackend(BaseAttnBackend):
         next_len = _next_power_of_2(bs)
         self.cached_ones_cpu = torch.ones(next_len, dtype=torch.int32, pin_memory=True)
         return self.cached_ones_cpu[:bs]
+    
+    def _compute_last_page_lens(self, seqlens: List[int]) -> torch.Tensor:
+        """
+        Compute the length of the last page for each sequence.
+        For page_size > 1, the last page may be partially filled.
+        Formula: ((seqlen - 1) % page_size) + 1
+        """
+        if self.page_size == 1:
+            return self._get_ones_cpu(len(seqlens))
+        
+        bs = len(seqlens)
+        last_lens = [((s - 1) % self.page_size) + 1 for s in seqlens]
+        
+        if bs > len(self.cached_last_page_lens):
+            next_len = _next_power_of_2(bs)
+            self.cached_last_page_lens = torch.empty(next_len, dtype=torch.int32, pin_memory=True)
+        
+        result = self.cached_last_page_lens[:bs]
+        for i, val in enumerate(last_lens):
+            result[i] = val
+        return result
+    
+    def _compute_num_pages(self, seqlen: int) -> int:
+        """Compute number of pages needed for a sequence."""
+        return (seqlen + self.page_size - 1) // self.page_size
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
@@ -201,34 +238,51 @@ class FlashInferBackend(BaseAttnBackend):
 
         device = self.device
         seq_len_cpu = torch.tensor(seqlens_k, **cpu_kwargs)
-        cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **cpu_kwargs).cumsum_(dim=0)
+        
+        # Convert token-based seqlens to page-based seqlens for indptr
+        # cu_seqlens_k_cpu contains cumulative page counts
+        seqlens_k_pages = [self._compute_num_pages(s) for s in seqlens_k]
+        cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k_pages, **cpu_kwargs).cumsum_(dim=0)
+        
         if max_seqlen_q == 1:  # decode with all extend_len = 1
             cu_seqlens_q_cpu = torch.arange(0, padded_size + 1, **cpu_kwargs)
         elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
-            cu_seqlens_q_cpu = cu_seqlens_k_cpu
+            # For prefill without cache, qo_indptr uses token counts
+            cu_seqlens_q_cpu = torch.tensor([0] + seqlens_k, **cpu_kwargs).cumsum_(dim=0)
         else:  # normal extend prefill, with partial cache hit
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **cpu_kwargs).cumsum_(dim=0)
+        
+        # Compute page indices: for each request, we need the page indices it uses
+        # page_table[table_idx, :num_pages] gives the physical page indices
+        indices_list = []
+        for req in reqs:
+            num_pages = self._compute_num_pages(req.device_len)
+            indices_list.append(self.page_table[req.table_idx, :num_pages])
+        
         batch.attn_metadata = FIMetadata(
             positions=make_positions(device, reqs),
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
-            indices=torch.cat([self.page_table[req.table_idx, : req.device_len] for req in reqs]),
-            last_page_len_cpu=self._get_ones_cpu(padded_size),
+            indices=torch.cat(indices_list),
+            last_page_len_cpu=self._compute_last_page_lens(seqlens_k),
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
             head_dim=self.config.head_dim,
-            page_size=1,
+            page_size=self.page_size,
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
+            window_left=self.window_left,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device)
+        # Calculate max pages based on page_size
+        max_pages = self._compute_num_pages(max_seq_len)
+        capture = FICaptureData.create(max_bs, max_pages, self.kvcache.device)
         capture.page_table = capture.page_table.view(-1)  # use 1D as ragged indices
         self.max_graph_bs = max_bs
         self.capture = capture
@@ -272,8 +326,21 @@ class FlashInferBackend(BaseAttnBackend):
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FIMetadata) and not metadata.initialized
         assert self.capture is not None and bs in self.capture_bs
+        
+        # Copy basic data
         self.capture.input_ids[:bs].copy_(batch.input_ids)
         self.capture.out_loc[:bs].copy_(batch.out_loc)
         self.capture.positions[:bs].copy_(metadata.positions)
+        self.capture.seq_lens[:bs].copy_(metadata.seq_lens_cpu)
+        
+        # Update page-based indptr
+        self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k_cpu)
+        
+        # Update last page lengths (computed from seq_lens_cpu)
+        last_page_lens = [((metadata.seq_lens_cpu[i].item() - 1) % self.page_size) + 1 
+                         for i in range(bs)]
+        for i, val in enumerate(last_page_lens):
+            self.capture.one_tensor[i] = val
+        
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)

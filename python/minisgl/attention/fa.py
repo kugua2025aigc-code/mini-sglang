@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -37,7 +37,14 @@ class FAMetadata(BaseAttnMetadata):
 
 
 class FlashAttentionBackend(BaseAttnBackend):
-    def __init__(self, config: ModelConfig, kvcache: BaseKVCache, page_table: torch.Tensor):
+    def __init__(
+        self, 
+        config: ModelConfig, 
+        kvcache: BaseKVCache, 
+        page_table: torch.Tensor,
+        page_size: int = 16,
+        sliding_window: Optional[int] = None,
+    ):
         self.config = config
         self.kvcache = kvcache
         self.capture: FACaptureData | None = None
@@ -45,6 +52,12 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
         self.page_table = page_table
+        self.page_size = page_size
+        # window_size: (-1, -1) means infinite context window
+        # window_size: (window_left, 0) enables sliding window attention
+        self.window_size: Tuple[int, int] = (-1, -1)
+        if sliding_window and sliding_window > 0:
+            self.window_size = (sliding_window, 0)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
@@ -62,6 +75,7 @@ class FlashAttentionBackend(BaseAttnBackend):
             cu_seqlens_k_new=metadata.cu_seqlens_k,
             max_seqlen_q=metadata.max_seqlen_q,
             softmax_scale=self.scale,
+            window_size=self.window_size,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:

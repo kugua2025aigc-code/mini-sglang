@@ -154,6 +154,7 @@ class Engine:
         self.kv_cache = create_kvcache(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
+            page_size=page_size,
             device=self.device,
             dtype=self.dtype,
         )
@@ -196,11 +197,16 @@ class Engine:
             (config.max_running_req + 1, self.max_seq_len),
             device=self.device,
         )
+        # Get sliding window config if enabled
+        sliding_window = getattr(config, 'sliding_window', None)
+        
         self.attn_backend = create_attention_backend(
             config.attention_backend,
             config.model_config,
             self.kv_cache,
             self.page_table,
+            page_size=page_size,
+            sliding_window=sliding_window,
         )
         self.moe_backend = (
             create_moe_backend(config.moe_backend)

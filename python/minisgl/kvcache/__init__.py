@@ -21,12 +21,24 @@ class CacheManagerCreator(Protocol):
     def __call__(self, device: torch.device) -> BaseCacheManager: ...
 
 
+class KVCacheCreator(Protocol):
+    def __call__(
+        self,
+        model_config: ModelConfig,
+        num_pages: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> BaseKVCache: ...
+
+
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
 
 
 def create_kvcache(
     model_config: ModelConfig,
     num_pages: int,
+    page_size: int,
     dtype: torch.dtype,
     device: torch.device,
     cache_layout: KVCacheLayout = KVCacheLayout.LayerFirst,
@@ -36,6 +48,7 @@ def create_kvcache(
     return MHAKVCache(
         num_kv_heads=model_config.num_kv_heads,
         num_pages=num_pages,
+        page_size=page_size,
         kv_layout=cache_layout,
         num_layers=model_config.num_layers,
         head_dim=model_config.head_dim,
