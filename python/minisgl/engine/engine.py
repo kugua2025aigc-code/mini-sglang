@@ -364,11 +364,12 @@ class Engine:
             dtype_size = self.dtype.itemsize
             logger.warning(f"Unknown kv_cache_dtype={kv_dtype}, using default")
 
-        # Calculate memory per page
-        # Formula: 2 (K+V) * head_dim * num_kv_heads * page_size * dtype_size * num_layers
+        # Calculate memory per page (memory for one page of KV cache)
+        # Note: The actual allocation is 2x this value (for K and V tensors),
+        # which is handled by MHAKVCache's buffer shape (2, num_pages, ...)
+        # Formula: head_dim * num_kv_heads * page_size * dtype_size * num_layers
         cache_per_page = (
-            2  # Key and Value tensors
-            * self.model_config.head_dim
+            self.model_config.head_dim
             * div_even(self.model_config.num_kv_heads, config.tp_info.size)
             * page_size
             * dtype_size
@@ -378,9 +379,10 @@ class Engine:
         num_pages = config.num_page_override
         if num_pages is None:
             # Calculate from available memory
+            # Note: Actual allocation is 2x cache_per_page (for K and V tensors)
             model_memory = old_free_memory - new_free_memory
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory
-            num_pages = available_memory // cache_per_page
+            num_pages = available_memory // (2 * cache_per_page)
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-tokens"
 
@@ -412,7 +414,7 @@ class Engine:
         real_kv_size = num_pages * cache_per_page
         logger.info(
             f"Allocating {num_pages} pages for KV cache, "
-            f"K + V = {mem_GB(real_kv_size)} "
+            f"per-page={mem_GB(cache_per_page)}, total K+V={mem_GB(2 * real_kv_size)} "
             f"(page_size={page_size}, dtype={'FP8' if dtype_size == 1 else 'FP16'})"
         )
         return num_pages
