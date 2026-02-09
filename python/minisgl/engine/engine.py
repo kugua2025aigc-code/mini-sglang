@@ -105,22 +105,45 @@ def supports_fp8(gpu_arch: str) -> bool:
 
 def check_fp8_usability() -> bool:
     """
-    Runtime check for FP8 availability.
+    Runtime check for FP8 availability for KV cache usage.
     
-    Some GPUs claim FP8 support but fail at runtime.
-    This function safely tests FP8 tensor creation.
+    FP8 in KV cache requires:
+    1. Tensor creation (storage)
+    2. View/reshape operations (paged attention)
+    3. FP8 <-> FP16 conversion (attention computation)
     
-    Returns:
-        bool: True if FP8 tensors can be created and used
+    Note: Direct FP8 arithmetic (+, -, *, /) is NOT supported by PyTorch.
+    This is expected - FP8 is for storage and scaled matmul only.
     """
     try:
-        # Test FP8 tensor creation
-        test_shape = (2, 64)  # Small test tensor
-        test_tensor = torch.zeros(test_shape, dtype=torch.float8_e4m3fn, device="cuda")
-        # Test basic operation
-        _ = test_tensor + test_tensor
+        # 1. Check dtype exists
+        if not hasattr(torch, 'float8_e4m3fn'):
+            return False
+            
+        # 2. Test tensor creation (core requirement)
+        x = torch.zeros((16, 64), dtype=torch.float8_e4m3fn, device="cuda")
+        
+        # 3. Test reshape (paged attention needs this)
+        x_reshaped = x.view(4, 256)
+        
+        # 4. Test FP8 <-> FP16 conversion (attention casts to FP16 for compute)
+        x_fp16 = x.to(torch.float16)
+        x_back = x_fp16.to(torch.float8_e4m3fn)
+        
+        # 5. Test slicing (sequence management)
+        _ = x[0:8, :]
+        
+        # 6. Test copy_ (KV cache updates)
+        y = torch.zeros_like(x)
+        y.copy_(x)
+        
+        del x, y, x_fp16, x_back
+        torch.cuda.synchronize()
+        
         return True
-    except (RuntimeError, AttributeError, TypeError):
+        
+    except Exception as e:
+        logger.debug(f"FP8 usability check failed: {e}")
         return False
 
 
