@@ -161,6 +161,13 @@ class Engine:
         # Detect GPU capabilities for cross-platform compatibility
         self.gpu_arch = get_gpu_architecture()
         logger.info_rank0(f"Detected GPU architecture: {self.gpu_arch}")
+        
+        # Determine KV cache dtype
+        kv_dtype = getattr(config, 'kv_cache_dtype', 'auto')
+        if kv_dtype == "fp8":
+            self.kv_cache_dtype = torch.float8_e4m3fn if supports_fp8(self.gpu_arch) else config.dtype
+        else:
+            self.kv_cache_dtype = config.dtype
 
         self.tp_cpu_group = self._init_communication(config)
         init_free_memory = self._sync_get_memory()[1]
@@ -173,11 +180,7 @@ class Engine:
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
         # Determine KV cache capacity with configurable hard limit
-        max_kv_pages = getattr(config, 'max_kv_pages', None) or 32768
-        self.num_pages = self.dummy_page = min(
-            self._determine_num_pages(init_free_memory, config),
-            max_kv_pages
-        )
+        self.num_pages = self.dummy_page = self._determine_num_pages(init_free_memory, config)
 
         # Calculate maximum sequence length based on page capacity
         page_size = getattr(config, 'page_size', None) or get_optimal_page_size(self.gpu_arch)
@@ -187,7 +190,7 @@ class Engine:
             num_pages=self.num_pages + 1,  # +1 for dummy page
             page_size=page_size,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self.kv_cache_dtype,
         )
         
         # Check if sliding window attention is enabled
@@ -378,15 +381,22 @@ class Engine:
         
         num_pages = config.num_page_override
         if num_pages is None:
-            # Calculate from available memory
-            # Note: Actual allocation is 2x cache_per_page (for K and V tensors)
-            model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
-            num_pages = available_memory // (2 * cache_per_page)
+            # Check if user explicitly set max_kv_pages
+            max_kv_pages = getattr(config, 'max_kv_pages', None)
+            if max_kv_pages and max_kv_pages > 0:
+                # User explicitly set max_kv_pages, use it directly
+                num_pages = max_kv_pages
+                logger.info(f"Using user-specified max_kv_pages: {num_pages}")
+            else:
+                # Calculate from available memory
+                # Note: Actual allocation is 2x cache_per_page (for K and V tensors)
+                model_memory = old_free_memory - new_free_memory
+                available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+                num_pages = available_memory // (2 * cache_per_page)
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-tokens"
 
-        # Apply hard limit from max_kv_pages config (prevents OOM)
+        # Apply hard limit from max_kv_pages config (prevents OOM if num_page_override was set)
         max_kv_pages = getattr(config, 'max_kv_pages', None)
         if max_kv_pages and max_kv_pages > 0:
             if num_pages > max_kv_pages:
