@@ -356,5 +356,10 @@ class FlashInferBackend(BaseAttnBackend):
         for i, val in enumerate(last_page_lens):
             self.capture.one_tensor[i] = val
         
+        # Update page indices for attention - this is critical for correct KV cache access
+        # metadata.indices contains the physical page indices for all sequences in the batch
+        num_indices = metadata.indices.shape[0]
+        self.capture.page_table[:num_indices].copy_(metadata.indices)
+        
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
