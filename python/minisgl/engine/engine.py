@@ -151,6 +151,9 @@ class Engine:
             max_kv_pages
         )
 
+        # Calculate maximum sequence length based on page capacity
+        page_size = getattr(config, 'page_size', None) or get_optimal_page_size(self.gpu_arch)
+        
         self.kv_cache = create_kvcache(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
@@ -158,9 +161,6 @@ class Engine:
             device=self.device,
             dtype=self.dtype,
         )
-        
-        # Calculate maximum sequence length based on page capacity
-        page_size = getattr(config, 'page_size', None) or get_optimal_page_size(self.gpu_arch)
         
         # Check if sliding window attention is enabled
         sliding_window = getattr(config, 'sliding_window', None)
