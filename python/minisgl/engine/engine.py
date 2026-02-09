@@ -40,7 +40,7 @@ def get_gpu_architecture() -> str:
     Detect GPU compute capability to determine supported features.
     
     Returns:
-        str: One of ["hopper", "ampere", "turing", "legacy"]
+        str: One of ["blackwell", "hopper", "ada", "ampere", "turing", "volta", "legacy"]
     """
     if not cuda.is_available():
         return "cpu"
@@ -48,16 +48,21 @@ def get_gpu_architecture() -> str:
     major, minor = cuda.get_device_capability()
     capability = major * 10 + minor
     
-    if capability >= 90:
-        return "hopper"  # H100, H800 - Native FP8 support
+    if capability >= 100:
+        return "blackwell"  # RTX 50-series, B200 (sm_100+)
+    elif capability >= 90:
+        return "hopper"     # H100, H800 (sm_90)
+    elif capability >= 89:
+        return "ada"        # RTX 4090, 4080, L40S (sm_89) 
     elif capability >= 80:
-        return "ampere"  # A100, A800, RTX 3090 - FP8 via emulation
+        return "ampere"     # A100, A800, RTX 3090 (sm_80, sm_86)
     elif capability >= 75:
-        return "turing"  # RTX 20-series, T4
+        return "turing"     # RTX 20-series, T4 (sm_75)
     elif capability >= 70:
-        return "volta"   # V100
+        return "volta"      # V100 (sm_70)
     else:
-        return "legacy"  # Older GPUs
+        return "legacy"
+    
 
 
 def get_optimal_page_size(gpu_arch: str) -> int:
