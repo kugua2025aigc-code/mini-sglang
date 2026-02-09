@@ -238,6 +238,7 @@ class Engine:
             self.page_table,
             page_size=page_size,
             sliding_window=sliding_window,
+            computation_dtype=self.dtype,
         )
         self.moe_backend = (
             create_moe_backend(config.moe_backend)

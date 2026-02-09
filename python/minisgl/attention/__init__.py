@@ -22,6 +22,7 @@ class BackendCreator(Protocol):
         page_table: torch.Tensor,
         page_size: int = 16,
         sliding_window: Optional[int] = None,
+        computation_dtype: Optional[torch.dtype] = None,
     ) -> BaseAttnBackend: ...
 
 
@@ -45,10 +46,11 @@ def create_fi_backend(
     page_table: torch.Tensor,
     page_size: int = 16,
     sliding_window: Optional[int] = None,
+    computation_dtype: Optional[torch.dtype] = None,
 ):
     from .fi import FlashInferBackend
 
-    return FlashInferBackend(config, kvcache, page_table, page_size, sliding_window)
+    return FlashInferBackend(config, kvcache, page_table, page_size, sliding_window, computation_dtype)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register("fa")
@@ -58,6 +60,7 @@ def create_fa_backend(
     page_table: torch.Tensor,
     page_size: int = 16,
     sliding_window: Optional[int] = None,
+    computation_dtype: Optional[torch.dtype] = None,
 ):
     from .fa import FlashAttentionBackend
 
@@ -78,6 +81,7 @@ def create_attention_backend(
     page_table: torch.Tensor,
     page_size: int = 16,
     sliding_window: Optional[int] = None,
+    computation_dtype: Optional[torch.dtype] = None,
 ) -> BaseAttnBackend:
     if backend == "auto":
         backend = resolve_auto_backend()
@@ -89,13 +93,13 @@ def create_attention_backend(
         p_backend, d_backend = backend.split(",", 1)
         if p_backend != d_backend:
             logger.info(f"Using hybrid attention backend: prefill={p_backend}, decode={d_backend}")
-            p_backend = create_attention_backend(p_backend, config, kvcache, page_table, page_size, sliding_window)
-            d_backend = create_attention_backend(d_backend, config, kvcache, page_table, page_size, sliding_window)
+            p_backend = create_attention_backend(p_backend, config, kvcache, page_table, page_size, sliding_window, computation_dtype)
+            d_backend = create_attention_backend(d_backend, config, kvcache, page_table, page_size, sliding_window, computation_dtype)
             return HybridBackend(p_backend, d_backend)
         backend = p_backend  # both are the same, fall through to single backend
         logger.warning(f"P/D attention backends are the same: {backend}, using single backend.")
 
-    return SUPPORTED_ATTENTION_BACKENDS[backend](config, kvcache, page_table, page_size, sliding_window)
+    return SUPPORTED_ATTENTION_BACKENDS[backend](config, kvcache, page_table, page_size, sliding_window, computation_dtype)
 
 
 __all__ = [

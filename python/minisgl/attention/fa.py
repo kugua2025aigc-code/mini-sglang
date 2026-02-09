@@ -44,6 +44,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         page_table: torch.Tensor,
         page_size: int = 16,
         sliding_window: Optional[int] = None,
+        computation_dtype: Optional[torch.dtype] = None,
     ):
         self.config = config
         self.kvcache = kvcache

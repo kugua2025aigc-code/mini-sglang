@@ -58,11 +58,17 @@ class FIMetadata(BaseAttnMetadata):
     page_size:          int  # tokens per page (e.g., 16)
     pos_encoding_mode:  str
     seq_lens_cpu:       torch.Tensor  # on cpu - token lengths
-    dtype:              torch.dtype
+    q_dtype:            torch.dtype  # dtype for query tensor (computation dtype)
+    kv_dtype:           torch.dtype  # dtype for kv cache (storage dtype, may be FP8)
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
     initialized:        bool = False
     window_left:        int = -1  # -1 means infinite context window (no sliding window)
     # fmt: on
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Backward compatibility: returns kv_dtype."""
+        return self.kv_dtype
 
     def __post_init__(self) -> None:
         assert self.page_size > 0, f"page_size must be positive, got {self.page_size}"
@@ -91,6 +97,7 @@ class FlashInferBackend(BaseAttnBackend):
         page_table: torch.Tensor,
         page_size: int = 16,
         sliding_window: Optional[int] = None,
+        computation_dtype: Optional[torch.dtype] = None,
     ) -> None:
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
@@ -103,6 +110,9 @@ class FlashInferBackend(BaseAttnBackend):
         self.page_size = page_size
         # sliding_window: -1 means infinite context window, positive value enables sliding window
         self.window_left = sliding_window if sliding_window and sliding_window > 0 else -1
+        # computation_dtype: dtype for query tensor (model computation dtype)
+        # kv_cache_dtype: dtype for kv cache (may be FP8 for storage efficiency)
+        self.computation_dtype = computation_dtype if computation_dtype is not None else kvcache.dtype
         
         self.float_workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.device
@@ -147,6 +157,9 @@ class FlashInferBackend(BaseAttnBackend):
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
         metadata.initialized = True
+        # Use separate dtypes for q and kv:
+        # - q_dtype: computation dtype (e.g., bfloat16)
+        # - kv_dtype: storage dtype (e.g., fp8_e4m3fn)
         if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
             metadata.wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
@@ -158,9 +171,9 @@ class FlashInferBackend(BaseAttnBackend):
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
-                data_type=metadata.dtype,
-                q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
+                data_type=metadata.q_dtype,  # Use q_dtype for output
+                q_data_type=metadata.q_dtype,
+                kv_data_type=metadata.kv_dtype,
                 window_left=metadata.window_left,
                 non_blocking=True,
             )
@@ -176,8 +189,8 @@ class FlashInferBackend(BaseAttnBackend):
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
-                q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
+                q_data_type=metadata.q_dtype,
+                kv_data_type=metadata.kv_dtype,
                 window_left=metadata.window_left,
                 non_blocking=True,
                 causal=True,
@@ -272,7 +285,8 @@ class FlashInferBackend(BaseAttnBackend):
             page_size=self.page_size,
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
-            dtype=self.kvcache.dtype,
+            q_dtype=self.computation_dtype,  # Query uses computation dtype
+            kv_dtype=self.kvcache.dtype,     # KV uses cache dtype (may be FP8)
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
             window_left=self.window_left,
         )
