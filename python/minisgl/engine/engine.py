@@ -367,15 +367,18 @@ class Engine:
                 num_pages = min(num_pages, max_kv_pages)
 
         # Apply sliding window constraint for long sequences
-        # Reduces memory usage by only caching recent tokens
+        # Note: sliding window attention limits the attention range during computation,
+        # but we still need to allocate enough KV cache to support the full max_seq_len.
+        # The KV cache size is determined by max_seq_len, not window_size.
         sliding_window = getattr(config, 'sliding_window', None)
         if sliding_window and sliding_window > 0:
-            window_pages = sliding_window // page_size
-            if num_pages > window_pages:
-                num_pages = window_pages
-                logger.info(
-                    f"Sliding window enabled: {sliding_window} tokens, "
-                    f"effective pages limited to: {num_pages}"
+            # Ensure we have enough pages for at least one full sequence
+            min_pages_needed = config.max_seq_len // page_size
+            if num_pages < min_pages_needed:
+                logger.warning(
+                    f"Sliding window enabled but KV cache too small: "
+                    f"{num_pages} pages < {min_pages_needed} needed for max_seq_len={config.max_seq_len}. "
+                    f"Consider increasing max_kv_pages."
                 )
 
         real_kv_size = num_pages * cache_per_page
